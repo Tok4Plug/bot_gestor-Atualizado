@@ -1,4 +1,4 @@
-# db.py (versão 100% avançada, robusta e assíncrona, com retroalimentação FB + GA4)
+# db.py (versão final, robusta e otimizada para alta escala no Railway)
 import os
 import asyncio
 import json
@@ -18,7 +18,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import SQLAlchemyError, OperationalError
 
 # ==============================
-# Logging centralizado
+# Logging
 # ==============================
 logging.basicConfig(
     level=logging.INFO,
@@ -41,7 +41,7 @@ try:
 except Exception as e:
     logger.warning(f"⚠️ Fernet indisponível, usando fallback base64: {e}")
 
-def _encrypt_value(s: str) -> str:
+def _encrypt_value(s: Any) -> str:
     if s is None:
         return s
     try:
@@ -49,7 +49,7 @@ def _encrypt_value(s: str) -> str:
     except Exception:
         return base64.b64encode(str(s).encode()).decode()
 
-def _decrypt_value(s: str) -> str:
+def _decrypt_value(s: Any) -> str:
     if s is None:
         return s
     try:
@@ -61,7 +61,7 @@ def _decrypt_value(s: str) -> str:
             return s
 
 def _safe_dict(d: Any, decrypt: bool = False) -> Dict[str, Any]:
-    """Garante dict e (opcionalmente) descriptografa valores str."""
+    """Garante dict e opcionalmente descriptografa strings."""
     if not isinstance(d, dict):
         return {}
     if not decrypt:
@@ -75,7 +75,7 @@ def _safe_dict(d: Any, decrypt: bool = False) -> Dict[str, Any]:
     return out
 
 # ==============================
-# Configuração DB
+# Config DB (core síncrono; interface assíncrona via run_in_executor)
 # ==============================
 DATABASE_URL = (
     os.getenv("DATABASE_URL")
@@ -94,9 +94,7 @@ engine = create_engine(
     future=True,
 ) if DATABASE_URL else None
 
-# Base precisa existir mesmo se engine for None (Alembic importa Base)
 Base = declarative_base()
-
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False) if engine else None
 
 # ==============================
@@ -109,30 +107,30 @@ class Buyer(Base):
     sid = Column(String(128), index=True, nullable=False)
     event_key = Column(String(128), unique=True, nullable=False, index=True)
 
-    # Tracking IDs
+    # Tracking IDs (Google & Facebook/Meta)
     src_url = Column(Text, nullable=True)
-    cid = Column(String(128), nullable=True)       # Client/Click ID (GA/Ads)
-    gclid = Column(String(256), nullable=True)     # Google Ads
-    fbclid = Column(String(256), nullable=True)    # Facebook Ads
-    wbraid = Column(String(256), nullable=True)    # Web2App Click
-    gbraid = Column(String(256), nullable=True)    # iOS/Android Ads
+    cid = Column(String(128), nullable=True)        # ClientID GA/Ads
+    gclid = Column(String(256), nullable=True)      # Google Ads web
+    fbclid = Column(String(256), nullable=True)     # Facebook Ads web
+    wbraid = Column(String(256), nullable=True)     # Google Web2App
+    gbraid = Column(String(256), nullable=True)     # Google App campaigns
     value = Column(Float, nullable=True)
 
     source = Column(String(32), nullable=True, default="bot")
 
-    # Dados enriquecidos (perfil e UTM podem ficar aqui)
-    user_data = Column(JSONB, nullable=False, default=dict)
-    custom_data = Column(JSONB, nullable=True, default=dict)
+    # Dados enriquecidos (perfil + UTM + flags de produto)
+    user_data = Column(JSONB, nullable=False, default=dict)   # {telegram_id, username, first_name, premium, utm_*, referrer, ip, ua, ...}
+    custom_data = Column(JSONB, nullable=True, default=dict)  # {purchase_count, subscribed, priority_score, ...}
 
     # Rastreio (cookies e device)
-    cookies = Column(JSONB, nullable=True)
+    cookies = Column(JSONB, nullable=True)          # valores criptografados (Fernet/base64)
     postal_code = Column(String(32), nullable=True)
     device_info = Column(JSONB, nullable=True)
-    session_metadata = Column(JSONB, nullable=True)
+    session_metadata = Column(JSONB, nullable=True) # {ts, source, ...}
 
     # Envio/histórico
     sent_pixels = Column(JSONB, nullable=True, default=list)  # lista de pixel_ids já enviados
-    event_history = Column(JSONB, nullable=True, default=list)
+    event_history = Column(JSONB, nullable=True, default=list) # [{event, status, response, ts}, ...]
 
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     sent = Column(Boolean, default=False, index=True)
@@ -191,46 +189,52 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
 
                 buyer = session.query(Buyer).filter(Buyer.event_key == ek).first()
 
-                # Normalização e enriquecimento
+                # Normalização e enriquecimento (mantém UTM/IDs também em user_data para telemetria)
                 normalized_ud = data.get("user_data") or {"telegram_id": telegram_id}
                 for key in [
                     "premium", "lang", "origin", "user_agent",
                     "ip_address", "utm_source", "utm_medium",
-                    "utm_campaign", "referrer", "gclid", "wbraid", "gbraid"
+                    "utm_campaign", "referrer", "gclid", "wbraid", "gbraid", "cid", "fbclid"
                 ]:
                     if data.get(key) is not None:
                         normalized_ud[key] = data.get(key)
 
+                # Metadata
                 device_info = data.get("device_info") or {}
-                session_metadata = data.get("session_metadata") or {"ts": int(time.time()), "source": data.get("source") or "bot"}
+                session_metadata = data.get("session_metadata") or {
+                    "ts": int(time.time()),
+                    "source": data.get("source") or "bot"
+                }
 
+                # Custom data
                 custom = data.get("custom_data") or {}
                 custom.setdefault("purchase_count", 0)
                 custom["priority_score"] = compute_priority_score(normalized_ud, custom)
 
-                # Criptografa cookies para armazenar
+                # Criptografia de cookies
                 cookies_in = data.get("cookies")
                 enc_cookies = None
                 if isinstance(cookies_in, dict) and cookies_in:
                     enc_cookies = {k: _encrypt_value(v) for k, v in cookies_in.items()}
 
+                # UPSERT
                 if buyer:
-                    # Merge
+                    # Atualização (merge)
                     buyer.user_data = {**(buyer.user_data or {}), **normalized_ud}
                     buyer.custom_data = {**(buyer.custom_data or {}), **custom}
                     buyer.src_url = data.get("src_url") or buyer.src_url
-                    buyer.cid = data.get("cid") or buyer.cid
+                    buyer.cid = data.get("cid") or buyer.cid or normalized_ud.get("cid")
                     buyer.gclid = data.get("gclid") or buyer.gclid or normalized_ud.get("gclid")
-                    buyer.fbclid = data.get("fbclid") or buyer.fbclid
+                    buyer.fbclid = data.get("fbclid") or buyer.fbclid or normalized_ud.get("fbclid")
                     buyer.wbraid = data.get("wbraid") or buyer.wbraid or normalized_ud.get("wbraid")
                     buyer.gbraid = data.get("gbraid") or buyer.gbraid or normalized_ud.get("gbraid")
                     buyer.value = data.get("value") if data.get("value") is not None else buyer.value
                     buyer.source = data.get("source") or buyer.source
 
                     if enc_cookies:
-                        existing = buyer.cookies or {}
-                        existing.update(enc_cookies)
-                        buyer.cookies = existing
+                        ec = buyer.cookies or {}
+                        ec.update(enc_cookies)
+                        buyer.cookies = ec
 
                     buyer.device_info = device_info or buyer.device_info
                     buyer.session_metadata = {**(buyer.session_metadata or {}), **session_metadata}
@@ -250,9 +254,9 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
                         sid=data.get("sid") or f"tg-{telegram_id}-{int(datetime.now().timestamp())}",
                         event_key=ek,
                         src_url=data.get("src_url"),
-                        cid=data.get("cid"),
+                        cid=data.get("cid") or normalized_ud.get("cid"),
                         gclid=data.get("gclid") or normalized_ud.get("gclid"),
-                        fbclid=data.get("fbclid"),
+                        fbclid=data.get("fbclid") or normalized_ud.get("fbclid"),
                         wbraid=data.get("wbraid") or normalized_ud.get("wbraid"),
                         gbraid=data.get("gbraid") or normalized_ud.get("gbraid"),
                         value=data.get("value"),
@@ -268,6 +272,7 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
                     )
                     session.add(buyer)
 
+                # Histórico de envio / métricas
                 if event_record:
                     if event_record.get("status") == "success":
                         buyer.last_sent_at = datetime.now(timezone.utc)
@@ -295,13 +300,10 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
     return await loop.run_in_executor(None, db_sync)
 
 # ==============================
-# Retrofeed helpers usados pelo worker
+# Leads pendentes para Pixels (para retrofeed/novos pixels)
 # ==============================
 async def get_unsent_leads_for_pixel(pixel_id: str, limit: int = 500) -> List[Dict[str, Any]]:
-    """
-    Busca buyers cujo sent_pixels NÃO contém pixel_id (ou sent_pixels é nulo).
-    Usa o operador JSONB containment de alto nível do SQLAlchemy (column.contains(obj)).
-    """
+    """Retorna buyers cujo sent_pixels NÃO contém pixel_id (ou sent_pixels é nulo)."""
     if not SessionLocal:
         return []
 
@@ -322,9 +324,8 @@ async def get_unsent_leads_for_pixel(pixel_id: str, limit: int = 500) -> List[Di
                 .limit(limit)
                 .all()
             )
-            out: List[Dict[str, Any]] = []
-            for r in rows:
-                out.append({
+            return [
+                {
                     "event_key": r.event_key,
                     "telegram_id": (r.user_data or {}).get("telegram_id"),
                     "user_data": r.user_data or {},
@@ -339,8 +340,9 @@ async def get_unsent_leads_for_pixel(pixel_id: str, limit: int = 500) -> List[Di
                     "gbraid": r.gbraid,
                     "sid": r.sid,
                     "sent_pixels": r.sent_pixels or [],
-                })
-            return out
+                }
+                for r in rows
+            ]
         except Exception as e:
             logger.error(f"Erro get_unsent_leads_for_pixel: {e}")
             return []
@@ -349,6 +351,9 @@ async def get_unsent_leads_for_pixel(pixel_id: str, limit: int = 500) -> List[Di
 
     return await loop.run_in_executor(None, db_sync)
 
+# ==============================
+# Marcar pixels como enviados
+# ==============================
 async def mark_pixels_sent(event_key: str, pixels: List[str], event_record: Optional[Dict[str, Any]] = None) -> bool:
     """Marca pixels como enviados e registra histórico/eventos/flags."""
     if not SessionLocal:
@@ -392,10 +397,10 @@ async def mark_pixels_sent(event_key: str, pixels: List[str], event_record: Opti
     return await loop.run_in_executor(None, db_sync)
 
 # ==============================
-# Histórico
+# Histórico de Leads (para aquecimento/priorização)
 # ==============================
-async def get_historical_leads(limit: int = 50, order_by_priority: bool = True):
-    """Leads históricos (decodificando cookies) com ordenação por prioridade + created_at."""
+async def get_historical_leads(limit: int = 50, order_by_priority: bool = True) -> List[Dict[str, Any]]:
+    """Leads históricos (decodificando cookies) + prioridade + created_at."""
     if not SessionLocal:
         return []
 
@@ -449,14 +454,14 @@ async def get_historical_leads(limit: int = 50, order_by_priority: bool = True):
     return await loop.run_in_executor(None, db_sync)
 
 # ==============================
-# Retroalimentação FB + GA4 de pendentes
+# Sync pendentes (FB + GA4) — mantém lógica de FB1/FB2
 # ==============================
 async def sync_pending_leads(batch_size: int = 20) -> int:
     """
     - Busca buyers com sent == False
     - Reconstrói lead_data com cookies/utm/ids
     - Dispara send_event_to_all (fb_google) respeitando regras de negócios
-      (Fb1: Lead/Subscribe; Fb2: Lead/Subscribe/Purchase value=12 BRL)
+      (FB1/FB2 intactos no fb_google)
     - Registra histórico via save_lead
     """
     if not SessionLocal:
@@ -493,7 +498,7 @@ async def sync_pending_leads(batch_size: int = 20) -> int:
             ud = b.user_data or {}
             cd = b.custom_data or {}
 
-            # Inferência simples do tipo de evento
+            # Inferência do tipo de evento (não altera lógica FB1/FB2)
             if bool(ud.get("subscribed") or cd.get("subscribed")):
                 event_type = "Subscribe"
             elif (cd.get("purchase_count") or 0) > 0:
@@ -501,7 +506,7 @@ async def sync_pending_leads(batch_size: int = 20) -> int:
             else:
                 event_type = "Lead"
 
-            # Reconstroi lead_data para o sender unificado
+            # Reconstroi lead_data (sender unificado monta payloads FB/GA4)
             lead_data = {
                 "telegram_id": ud.get("telegram_id"),
                 "user_agent": ud.get("user_agent"),
@@ -519,15 +524,17 @@ async def sync_pending_leads(batch_size: int = 20) -> int:
                 "gclid": ud.get("gclid") or b.gclid,
                 "wbraid": ud.get("wbraid") or b.wbraid,
                 "gbraid": ud.get("gbraid") or b.gbraid,
-                "cid": b.cid,
-                "fbclid": b.fbclid,
+                "cid": ud.get("cid") or b.cid,
+                "fbclid": ud.get("fbclid") or b.fbclid,
             }
 
             # Dispara FB + GA4
             results = await send_event_to_all(lead_data, et=event_type)
 
-            # Atualiza via save_lead (histórico + flags + pixels enviados)
+            # Pixels enviados (chaves do dict de resultados)
             sent_pixels = [k for k, v in (results or {}).items() if isinstance(v, dict)]
+
+            # Atualiza via save_lead (histórico + flags + pixels enviados)
             await save_lead(
                 {
                     "event_key": b.event_key,
