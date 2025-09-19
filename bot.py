@@ -1,4 +1,4 @@
-# bot.py (versão avançada, robusta e assíncrona com Typebot autenticado)
+# bot.py (versão otimizada para resposta rápida, robusta e assíncrona)
 import os, logging, json, asyncio, time
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
@@ -102,8 +102,7 @@ async def forward_to_typebot(lead: dict):
                     logger.info(json.dumps({
                         "event": "TYPEBOT_OK",
                         "telegram_id": lead.get("telegram_id"),
-                        "status": r.status,
-                        "body": body
+                        "status": r.status
                     }))
                 else:
                     logger.warning(json.dumps({
@@ -153,7 +152,7 @@ async def send_event_with_retry(event_type: str, lead: dict, retries=5, delay=2,
     return False
 
 # =============================
-# Processamento de novo lead
+# Processamento de novo lead (rápido)
 # =============================
 async def process_new_lead(msg: types.Message):
     user_id, name = msg.from_user.id, msg.from_user.full_name
@@ -184,13 +183,17 @@ async def process_new_lead(msg: types.Message):
         "utm_campaign": args.get("utm_campaign"),
     }
 
+    # Salva lead (essencial)
     await save_lead(lead)
-    await forward_to_typebot(lead)
 
-    for evt in ["Lead", "Subscribe", "Purchase"]:
-        await send_event_with_retry(evt, lead)
-
+    # Gera o link VIP primeiro
     vip_link = await generate_vip_link(lead["event_key"])
+
+    # Dispara processos em paralelo (não segura resposta do usuário)
+    asyncio.create_task(forward_to_typebot(lead))
+    for evt in ["Lead", "Subscribe", "Purchase"]:
+        asyncio.create_task(send_event_with_retry(evt, lead))
+
     return vip_link, lead
 
 # =============================
