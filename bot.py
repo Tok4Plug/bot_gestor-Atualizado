@@ -1,4 +1,4 @@
-# bot.py (versão avançada, robusta e assíncrona)
+# bot.py (versão avançada, robusta e assíncrona com Typebot autenticado)
 import os, logging, json, asyncio, time
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
@@ -31,7 +31,6 @@ ch = logging.StreamHandler()
 ch.setFormatter(JSONFormatter())
 logger.addHandler(ch)
 
-# Warmup logger
 warmup_logger = logging.getLogger("warmup")
 warmup_logger.setLevel(logging.INFO)
 ch_warm = logging.StreamHandler()
@@ -44,9 +43,13 @@ warmup_logger.addHandler(ch_warm)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 VIP_CHANNEL = os.getenv("VIP_CHANNEL")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-TYPEBOT_URL = os.getenv("TYPEBOT_URL")
-SECRET_KEY = os.getenv("SECRET_KEY", Fernet.generate_key().decode())
 
+# Typebot autenticado
+TYPEBOT_API_URL = os.getenv("TYPEBOT_API_URL", "https://typebot.io/api/v1")
+TYPEBOT_API_KEY = os.getenv("TYPEBOT_API_KEY")
+TYPEBOT_BOT_ID = os.getenv("TYPEBOT_BOT_ID")
+
+SECRET_KEY = os.getenv("SECRET_KEY", Fernet.generate_key().decode())
 fernet = Fernet(SECRET_KEY.encode() if isinstance(SECRET_KEY, str) else SECRET_KEY)
 
 if not BOT_TOKEN or not VIP_CHANNEL:
@@ -77,17 +80,38 @@ def decrypt_data(token: str) -> str:
     return fernet.decrypt(token.encode()).decode() if token else ""
 
 # =============================
-# Integração Typebot
+# Integração Typebot autenticada
 # =============================
 async def forward_to_typebot(lead: dict):
-    if not TYPEBOT_URL: return
+    if not TYPEBOT_API_URL or not TYPEBOT_API_KEY or not TYPEBOT_BOT_ID:
+        logger.warning(json.dumps({"event": "TYPEBOT_DISABLED"}))
+        return
+
+    url = f"{TYPEBOT_API_URL}/typebots/{TYPEBOT_BOT_ID}/startChat"
+    headers = {
+        "Authorization": f"Bearer {TYPEBOT_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {"variables": lead}
+
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.post(TYPEBOT_URL, json=lead, timeout=8) as r:
+            async with s.post(url, headers=headers, json=payload, timeout=10) as r:
+                body = await r.text()
                 if r.status in (200, 201):
-                    logger.info(json.dumps({"event": "TYPEBOT_OK", "telegram_id": lead.get("telegram_id")}))
+                    logger.info(json.dumps({
+                        "event": "TYPEBOT_OK",
+                        "telegram_id": lead.get("telegram_id"),
+                        "status": r.status,
+                        "body": body
+                    }))
                 else:
-                    logger.warning(json.dumps({"event": "TYPEBOT_FAIL", "status": r.status}))
+                    logger.warning(json.dumps({
+                        "event": "TYPEBOT_FAIL",
+                        "telegram_id": lead.get("telegram_id"),
+                        "status": r.status,
+                        "body": body
+                    }))
     except Exception as e:
         logger.error(json.dumps({"event": "TYPEBOT_ERROR", "error": str(e)}))
 
