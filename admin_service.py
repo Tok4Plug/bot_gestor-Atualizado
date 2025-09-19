@@ -1,4 +1,4 @@
-# admin_service.py (atualizado e sincronizado com a stack final)
+# admin_service.py (atualizado e sincronizado com webhook do Typebot)
 import os, json, traceback
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import PlainTextResponse
@@ -31,6 +31,7 @@ PIXEL_RETROFEED = Counter('admin_pixel_retrofeed_total', 'Leads retroalimentados
 PIXELS_SENT = Counter('admin_retrofeed_pixel_sent_total', 'Eventos retroalimentados por pixel', ['pixel_id'])
 PROCESS_LATENCY = Histogram('admin_retrofeed_latency_seconds', 'Tempo de retrofeed em massa')
 BATCH_SIZE_GAUGE = Gauge('admin_retrofeed_batch_size', 'Tamanho do lote processado')
+TYPEBOT_WEBHOOKS = Counter('admin_typebot_webhooks_total', 'Total de webhooks recebidos do Typebot')
 
 # ===============================
 # Inicialização do app
@@ -67,7 +68,8 @@ def stats(auth=Depends(check_auth)):
         "new_pixel_ids": NEW_PIXEL_IDS,
         "retro_batch_size": RETRO_BATCH_SIZE,
         "leads_requeued_total": LEADS_REQUEUED._value.get(),
-        "pixel_retrofeed_total": PIXEL_RETROFEED._value.get()
+        "pixel_retrofeed_total": PIXEL_RETROFEED._value.get(),
+        "typebot_webhooks_total": TYPEBOT_WEBHOOKS._value.get()
     }
 
 # ===============================
@@ -78,6 +80,63 @@ def encrypt_data(data: str) -> str:
 
 def decrypt_data(token: str) -> str:
     return fernet.decrypt(token.encode()).decode()
+
+# ===============================
+# Endpoint: Webhook do Typebot
+# ===============================
+@app.post("/typebot/webhook")
+async def typebot_webhook(req: Request):
+    """Recebe callbacks do Typebot e envia para Redis/Pixels"""
+    try:
+        body = await req.json()
+        TYPEBOT_WEBHOOKS.inc()
+
+        telegram_id = body.get("telegramId")
+        session_id = body.get("sessionId")
+        email = body.get("email")
+        phone = body.get("phone")
+
+        # Monta lead_data enriquecido
+        lead_data = {
+            "telegram_id": telegram_id,
+            "session_id": session_id,
+            "email": email,
+            "phone": phone,
+            "src_url": body.get("src"),
+            "gclid": body.get("gclid"),
+            "wbraid": body.get("wbraid"),
+            "gbraid": body.get("gbraid"),
+            "fbc": body.get("fbc"),
+            "fbp": body.get("fbp"),
+            "user_agent": body.get("ua"),
+            "ip": body.get("ip"),
+            "custom_data": body.get("customData", {})
+        }
+
+        # Constrói evento FB para retroalimentar
+        fb_event = build_fb_event(
+            event_name="Lead",
+            lead_data=lead_data,
+            platform="fb2"
+        )
+
+        payload = {
+            "event_key": f"typebot-{telegram_id}-{int(datetime.utcnow().timestamp())}",
+            "sid": session_id,
+            "payload": json.dumps(fb_event)
+        }
+
+        r = Redis.from_url(REDIS_URL, decode_responses=True)
+        for pixel_id in NEW_PIXEL_IDS:
+            r.xadd(STREAM, {**payload, "pixel_id": pixel_id})
+            PIXEL_RETROFEED.inc()
+            PIXELS_SENT.labels(pixel_id=pixel_id).inc()
+
+        return {"status": "received", "telegram_id": telegram_id}
+
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Webhook error: {str(e)}")
 
 # ===============================
 # Endpoint: reprocessar lead único
@@ -91,15 +150,13 @@ def resend(event_key: str, req: Request, auth=Depends(check_auth)):
     if not lead:
         raise HTTPException(status_code=404, detail='Lead não encontrado')
 
-    # Reset para novo envio
     lead.sent = False
     lead.attempts = 0
     session.commit()
     LEADS_REQUEUED.inc()
 
-    # Reconstroi payload no formato unificado
     fb_event = build_fb_event(
-        event_name="Lead", 
+        event_name="Lead",
         lead_data={
             "event_key": lead.event_key,
             "src_url": lead.src_url,
@@ -108,7 +165,7 @@ def resend(event_key: str, req: Request, auth=Depends(check_auth)):
             "cid": lead.cid,
             "value": lead.value or 0,
         },
-        platform="fb2", 
+        platform="fb2",
         custom_data=lead.custom_data
     )
 
