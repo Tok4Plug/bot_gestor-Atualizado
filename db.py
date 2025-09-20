@@ -1,4 +1,3 @@
-# db.py
 import os, asyncio, json, time, hashlib, base64, logging
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
@@ -129,7 +128,7 @@ def init_db():
         logger.error(f"Erro init DB: {e}")
 
 # ==============================
-# Priority Score (enriquecimento útil)
+# Priority Score
 # ==============================
 def compute_priority_score(user_data: Dict[str, Any], custom_data: Dict[str, Any]) -> float:
     score = 0.0
@@ -173,6 +172,7 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
                     enc_cookies = {k: _encrypt_value(v) for k, v in data["cookies"].items()}
 
                 if lead:
+                    # update
                     lead.user_data = {**(lead.user_data or {}), **normalized_ud}
                     lead.custom_data = {**(lead.custom_data or {}), **custom}
                     lead.src_url = data.get("src_url") or lead.src_url
@@ -187,6 +187,7 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
                         eh.append(event_record)
                         lead.event_history = eh
                 else:
+                    # insert
                     lead = Lead(
                         event_key=ek,
                         telegram_id=telegram_id,
@@ -250,6 +251,52 @@ async def get_unsent_leads(limit: int = 500) -> List[Dict[str, Any]]:
             return [r.user_data for r in rows]
         except Exception as e:
             logger.error(f"Erro get_unsent_leads: {e}")
+            return []
+        finally:
+            session.close()
+
+    return await loop.run_in_executor(None, db_sync)
+
+# ==============================
+# Recuperar leads históricos
+# ==============================
+async def get_historical_leads(limit: int = 50) -> List[Dict[str, Any]]:
+    if not SessionLocal:
+        return []
+
+    loop = asyncio.get_event_loop()
+
+    def db_sync():
+        session = SessionLocal()
+        try:
+            rows = (
+                session.query(Lead)
+                .order_by(Lead.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+            leads = []
+            for r in rows:
+                ud, cd = r.user_data or {}, r.custom_data or {}
+                dec_cookies = _safe_dict(r.cookies or {}, decrypt=True) if r.cookies else {}
+                leads.append({
+                    "telegram_id": r.telegram_id,
+                    "event_key": r.event_key,
+                    "event_type": r.event_type,
+                    "route_key": r.route_key,
+                    "src_url": r.src_url,
+                    "value": r.value,
+                    "user_data": ud,
+                    "custom_data": cd,
+                    "cookies": dec_cookies,
+                    "sent": r.sent,
+                    "event_history": r.event_history or [],
+                    "priority_score": cd.get("priority_score") or 0.0,
+                    "created_at": r.created_at.isoformat()
+                })
+            return leads
+        except Exception as e:
+            logger.error(f"Erro get_historical_leads: {e}")
             return []
         finally:
             session.close()
