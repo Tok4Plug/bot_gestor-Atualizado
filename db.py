@@ -4,7 +4,7 @@ from typing import List, Optional, Dict, Any
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean,
-    DateTime, Float, Text, func
+    DateTime, Float, Text
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -302,3 +302,68 @@ async def get_historical_leads(limit: int = 50) -> List[Dict[str, Any]]:
             session.close()
 
     return await loop.run_in_executor(None, db_sync)
+
+# ==============================
+# Sincronizar leads pendentes (retrofeed FB + Google)
+# ==============================
+async def sync_pending_leads(batch_size: int = 20) -> int:
+    if not SessionLocal:
+        return 0
+
+    loop = asyncio.get_event_loop()
+
+    def fetch_pending():
+        session = SessionLocal()
+        try:
+            return (
+                session.query(Lead)
+                .filter(Lead.sent == False)
+                .order_by(Lead.created_at.asc())
+                .limit(batch_size)
+                .all()
+            )
+        except Exception as e:
+            logger.error(f"Erro query pending leads: {e}")
+            return []
+        finally:
+            session.close()
+
+    leads = await loop.run_in_executor(None, fetch_pending)
+    if not leads:
+        return 0
+
+    from fb_google import send_event_to_all  # lazy import
+
+    processed = 0
+    for l in leads:
+        try:
+            ud = l.user_data or {}
+            event_type = l.event_type or "Lead"
+
+            lead_data = {
+                "telegram_id": l.telegram_id,
+                "user_data": ud,
+                "event_key": l.event_key,
+                "event_type": event_type,
+                "cookies": _safe_dict(l.cookies or {}, decrypt=True),
+                "src_url": l.src_url,
+                "value": l.value,
+            }
+
+            results = await send_event_to_all(lead_data, et=event_type)
+
+            if any((isinstance(v, dict) and v.get("ok")) for v in (results or {}).values()):
+                l.sent = True
+                l.last_sent_at = datetime.now(timezone.utc)
+
+            session = SessionLocal()
+            session.merge(l)
+            session.commit()
+            session.close()
+
+            processed += 1
+
+        except Exception as e:
+            logger.error(f"[SYNC_PENDING_ERROR] ek={l.event_key} err={e}")
+
+    return processed
