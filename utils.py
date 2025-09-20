@@ -1,4 +1,3 @@
-# utils.py
 import os, re, time, hashlib
 from datetime import datetime, timedelta, timezone
 
@@ -12,7 +11,6 @@ EVENT_ID_SALT = os.getenv("EVENT_ID_SALT", "change_me")
 SEND_LEAD_ON = (os.getenv("SEND_LEAD_ON", "botb") or "").lower()
 SEND_SUBSCRIBE_ON = (os.getenv("SEND_SUBSCRIBE_ON", "vip") or "").lower()
 
-GOOGLE_MODE = os.getenv("GOOGLE_MODE", "GA4").upper()
 GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID", "")
 GA4_API_SECRET = os.getenv("GA4_API_SECRET", "")
 GA4_CLIENT_ID_FALLBACK_PREFIX = os.getenv("GA4_CLIENT_ID_FALLBACK_PREFIX", "tlgrm-")
@@ -21,7 +19,7 @@ GA4_CLIENT_ID_FALLBACK_PREFIX = os.getenv("GA4_CLIENT_ID_FALLBACK_PREFIX", "tlgr
 # Helpers básicos
 # ==============================
 def _sha256(s: str) -> str:
-    return hashlib.sha256(s.encode()).hexdigest()
+    return hashlib.sha256((s or "").encode()).hexdigest()
 
 def _norm(s: str) -> str:
     return (s or "").strip().lower()
@@ -84,6 +82,7 @@ def normalize_user_data(raw: dict) -> dict:
     if zp:      ud["zp"] = _sha256(zp)
     if external_id: ud["external_id"] = _sha256(external_id)
 
+    # Captura enriquecimentos adicionais
     if raw.get("fbp"): ud["fbp"] = raw.get("fbp")
     if raw.get("fbc"): ud["fbc"] = raw.get("fbc")
     if raw.get("ip"): ud["client_ip_address"] = raw.get("ip")
@@ -117,7 +116,26 @@ def build_fb_payload(pixel_id: str, event_name: str, lead: dict) -> dict:
     evid = build_event_id(event_name, lead, etime)
 
     user_data = normalize_user_data(lead.get("user_data") or lead)
-    event_source_url = lead.get("event_source_url") or lead.get("src_url") or lead.get("landing_url")
+
+    # Enriquecimento custom_data
+    custom_data = {
+        "currency": lead.get("currency") or "BRL",
+        "value": lead.get("value") or 0,
+        "utm_source": lead.get("utm_source"),
+        "utm_medium": lead.get("utm_medium"),
+        "utm_campaign": lead.get("utm_campaign"),
+        "utm_term": lead.get("utm_term"),
+        "utm_content": lead.get("utm_content"),
+    }
+    custom_data = {k: v for k, v in custom_data.items() if v}
+
+    # Device info & session metadata enriquecem event_source_url
+    event_source_url = (
+        lead.get("event_source_url")
+        or lead.get("src_url")
+        or lead.get("landing_url")
+        or (lead.get("device_info") or {}).get("url")
+    )
 
     return {
         "data": [{
@@ -127,7 +145,7 @@ def build_fb_payload(pixel_id: str, event_name: str, lead: dict) -> dict:
             "action_source": ACTION_SOURCE,
             "event_source_url": event_source_url,
             "user_data": user_data,
-            "custom_data": {}
+            "custom_data": custom_data
         }]
     }
 
@@ -143,8 +161,11 @@ def to_ga4_event_name(event_name: str) -> str:
     return e
 
 def build_ga4_payload(event_name: str, lead: dict) -> dict:
-    client_id = lead.get("gclid") or lead.get("client_id") \
+    client_id = (
+        lead.get("gclid")
+        or lead.get("client_id")
         or (GA4_CLIENT_ID_FALLBACK_PREFIX + str(lead.get("telegram_id") or lead.get("external_id") or "anon"))
+    )
     user_id = str(lead.get("telegram_id") or lead.get("external_id") or "")
 
     params = {
@@ -153,7 +174,9 @@ def build_ga4_payload(event_name: str, lead: dict) -> dict:
         "campaign": lead.get("utm_campaign"),
         "term": lead.get("utm_term"),
         "content": lead.get("utm_content"),
-        "event_source_url": lead.get("event_source_url") or lead.get("landing_url")
+        "event_source_url": lead.get("event_source_url") or lead.get("landing_url"),
+        "currency": lead.get("currency") or "BRL",
+        "value": lead.get("value") or 0,
     }
     params = {k: v for k, v in params.items() if v}
 

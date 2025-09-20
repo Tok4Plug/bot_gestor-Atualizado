@@ -1,13 +1,14 @@
 import os, logging, json, asyncio, time
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
-import redis, aiohttp
+import redis
 from cryptography.fernet import Fernet
 from prometheus_client import Counter, Histogram
 
 # DB / Pixel
 from db import save_lead, init_db, get_historical_leads, sync_pending_leads
-from fb_google import send_event_to_all, enqueue_event, process_event_queue
+from fb_google import send_event_with_retry, process_event_queue
+from utils import now_ts
 
 # =============================
 # Logging estruturado
@@ -80,39 +81,16 @@ async def generate_vip_link(event_key: str, member_limit=1, expire_hours=24):
         return None
 
 # =============================
-# Envio com retry exponencial
-# =============================
-async def send_event_with_retry(event_type: str, lead: dict, retries=5, delay=2):
-    attempt = 0
-    while attempt < retries:
-        try:
-            await send_event_to_all(lead, et=event_type)
-            LEADS_SENT.inc()
-            logger.info(json.dumps({
-                "event": event_type,
-                "telegram_id": lead.get("telegram_id"),
-                "status": "success"
-            }))
-            return True
-        except Exception as e:
-            attempt += 1
-            EVENT_RETRIES.inc()
-            logger.warning(json.dumps({
-                "event": event_type,
-                "telegram_id": lead.get("telegram_id"),
-                "status": "retry",
-                "attempt": attempt,
-                "error": str(e)
-            }))
-            await asyncio.sleep(delay ** attempt)
-    logger.error(json.dumps({"event": event_type, "telegram_id": lead.get("telegram_id"), "status": "failed"}))
-    return False
-
-# =============================
 # Processamento de novo lead
 # =============================
 async def process_new_lead(msg: types.Message):
     user_id = msg.from_user.id
+
+    # Simulação de cookies/utm (poderia vir do Typebot ou query string)
+    cookies = {
+        "_fbp": encrypt_data(f"fbp-{user_id}-{int(time.time())}"),
+        "_fbc": encrypt_data(f"fbc-{user_id}-{int(time.time())}")
+    }
 
     lead = {
         "telegram_id": user_id,
@@ -125,6 +103,17 @@ async def process_new_lead(msg: types.Message):
         "user_agent": "TelegramBot/1.0",
         "ip_address": f"192.168.{user_id % 256}.{(user_id // 256) % 256}",
         "event_key": f"tg-{user_id}-{int(time.time())}",
+        "event_time": now_ts(),
+
+        # cookies e metadados
+        "cookies": cookies,
+        "device_info": {"platform": "telegram", "app": "aiogram"},
+        "session_metadata": {"msg_id": msg.message_id, "chat_id": msg.chat.id},
+
+        # UTM placeholders
+        "utm_source": "telegram",
+        "utm_medium": "botb",
+        "utm_campaign": "vip_access",
     }
 
     # Salva lead no DB
@@ -133,7 +122,7 @@ async def process_new_lead(msg: types.Message):
     # Gera link VIP
     vip_link = await generate_vip_link(lead["event_key"])
 
-    # Dispara eventos (Lead e Subscribe)
+    # Dispara eventos
     asyncio.create_task(send_event_with_retry("Lead", lead))
     asyncio.create_task(send_event_with_retry("Subscribe", lead))
 
