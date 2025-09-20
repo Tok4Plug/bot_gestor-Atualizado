@@ -46,8 +46,7 @@ async def send_event_fb(event_name: str, lead: dict):
     url = f"https://graph.facebook.com/{FB_API_VERSION}/{FB_PIXEL_ID}/events?access_token={FB_ACCESS_TOKEN}"
 
     async with aiohttp.ClientSession() as session:
-        res = await post_with_retry(session, url, payload, retries=FB_RETRY_MAX, platform="facebook", et=event_name)
-        return res
+        return await post_with_retry(session, url, payload, retries=FB_RETRY_MAX, platform="facebook", et=event_name)
 
 # =========================
 # Envio para Google GA4
@@ -60,37 +59,61 @@ async def send_event_google(event_name: str, lead: dict):
     url = f"https://www.google-analytics.com/mp/collect?measurement_id={GA4_MEASUREMENT_ID}&api_secret={GA4_API_SECRET}"
 
     async with aiohttp.ClientSession() as session:
-        res = await post_with_retry(session, url, payload, retries=3, platform="ga4", et=event_name)
-        return res
+        return await post_with_retry(session, url, payload, retries=3, platform="ga4", et=event_name)
 
 # =========================
 # Função principal unificada
 # =========================
 async def send_event_to_all(lead: dict, et: str = "Lead"):
     """
-    Dispara evento Lead/Subscribe para:
+    Dispara evento (Lead/Subscribe) para:
       - Facebook (sempre)
       - Google GA4 (se configurado)
     """
-    results = {}
-    results["facebook"] = await send_event_fb(et, lead)
+    results = {"facebook": await send_event_fb(et, lead)}
     if GOOGLE_ENABLED:
         results["google"] = await send_event_google(et, lead)
     return results
 
 # =========================
-# Placeholders de fila
+# Retry wrapper (usado pelo bot.py)
 # =========================
-async def enqueue_event(event: dict):
-    """
-    Placeholder: pode ser integrado com Redis/Kafka se quiser fila de eventos.
-    """
-    logger.info(f"[QUEUE] {json.dumps(event)}")
-    return True
+async def send_event_with_retry(event_type: str, lead: dict, retries=5, delay=2):
+    attempt = 0
+    while attempt < retries:
+        try:
+            results = await send_event_to_all(lead, et=event_type)
+            if any(r.get("ok") for r in results.values() if isinstance(r, dict)):
+                logger.info(json.dumps({
+                    "event": event_type,
+                    "telegram_id": lead.get("telegram_id"),
+                    "status": "success"
+                }))
+                return {"status": "success", "results": results}
+        except Exception as e:
+            logger.warning(f"[send_event_with_retry] tentativa {attempt+1} falhou: {e}")
+        attempt += 1
+        await asyncio.sleep(delay ** attempt)
+    logger.error(json.dumps({
+        "event": event_type,
+        "telegram_id": lead.get("telegram_id"),
+        "status": "failed"
+    }))
+    return {"status": "failed", "event": event_type}
+
+# =========================
+# Queue de eventos
+# =========================
+_event_queue = asyncio.Queue()
+
+async def enqueue_event(event_type: str, lead: dict):
+    """Coloca evento na fila para envio posterior"""
+    await _event_queue.put((event_type, lead))
+    logger.info(f"[QUEUE_ENQ] {event_type} -> {lead.get('telegram_id')}")
 
 async def process_event_queue():
-    """
-    Placeholder: processa fila de eventos pendentes (se implementado).
-    """
-    logger.info("[QUEUE] Processamento simulado")
-    return True
+    """Processa continuamente eventos da fila"""
+    while True:
+        event_type, lead = await _event_queue.get()
+        await send_event_with_retry(event_type, lead)
+        _event_queue.task_done()

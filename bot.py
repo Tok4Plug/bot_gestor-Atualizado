@@ -1,13 +1,14 @@
 import os, logging, json, asyncio, time
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
+from aiogram.utils import exceptions as tg_exceptions
 import redis
 from cryptography.fernet import Fernet
 from prometheus_client import Counter, Histogram
 
-# DB / Pixel
+# DB / Pixels
 from db import save_lead, init_db, get_historical_leads, sync_pending_leads
-from fb_google import send_event_with_retry, process_event_queue
+from fb_google import enqueue_event, process_event_queue, send_event_with_retry
 from utils import now_ts
 
 # =============================
@@ -37,6 +38,7 @@ logger.addHandler(ch)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 VIP_CHANNEL = os.getenv("VIP_CHANNEL")  # chat_id do canal VIP (ex: -1001234567890)
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+SYNC_INTERVAL_SEC = int(os.getenv("SYNC_INTERVAL_SEC", "60"))  # frequência do retrofeed
 
 SECRET_KEY = os.getenv("SECRET_KEY", Fernet.generate_key().decode())
 fernet = Fernet(SECRET_KEY.encode() if isinstance(SECRET_KEY, str) else SECRET_KEY)
@@ -54,7 +56,7 @@ init_db()
 # =============================
 # Métricas Prometheus
 # =============================
-LEADS_SENT = Counter('bot_leads_sent_total', 'Total de leads enviados')
+LEADS_SENT = Counter('bot_leads_sent_total', 'Total de leads enfileirados/enviados')
 EVENT_RETRIES = Counter('bot_event_retries_total', 'Retries em eventos')
 PROCESS_LATENCY = Histogram('bot_process_latency_seconds', 'Latência no processamento')
 
@@ -68,6 +70,10 @@ def encrypt_data(data: str) -> str:
 # VIP Link
 # =============================
 async def generate_vip_link(event_key: str, member_limit=1, expire_hours=24):
+    """
+    Gera link de convite temporário para o canal VIP.
+    Caso falhe (sem permissões, etc.), retorna None.
+    """
     try:
         invite = await bot.create_chat_invite_link(
             chat_id=int(VIP_CHANNEL),
@@ -76,55 +82,97 @@ async def generate_vip_link(event_key: str, member_limit=1, expire_hours=24):
             name=f"VIP-{event_key}"
         )
         return invite.invite_link
+    except tg_exceptions.TelegramAPIError as e:
+        logger.error(json.dumps({"event": "VIP_LINK_ERROR", "error": str(e)}))
+        return None
     except Exception as e:
         logger.error(json.dumps({"event": "VIP_LINK_ERROR", "error": str(e)}))
         return None
 
 # =============================
-# Processamento de novo lead
+# Util: parse de argumentos (/start {json})
+# =============================
+def parse_start_args(msg: types.Message) -> dict:
+    """
+    Tenta extrair JSON dos argumentos do /start para enriquecer UTM/cookies/etc.
+    Se não houver ou estiver inválido, retorna {}.
+    """
+    try:
+        # aiogram 2.x: msg.get_args() contém texto após /start
+        if hasattr(msg, "get_args"):
+            raw = msg.get_args()
+            if raw:
+                return json.loads(raw)
+    except Exception:
+        pass
+    return {}
+
+# =============================
+# Processamento de novo lead (alta escala)
 # =============================
 async def process_new_lead(msg: types.Message):
-    user_id = msg.from_user.id
+    user = msg.from_user
+    user_id = user.id
 
-    # Simulação de cookies/utm (poderia vir do Typebot ou query string)
-    cookies = {
-        "_fbp": encrypt_data(f"fbp-{user_id}-{int(time.time())}"),
-        "_fbc": encrypt_data(f"fbc-{user_id}-{int(time.time())}")
-    }
+    # 1) Enriquecimento por args/UTMs (se vier do Typebot, redirect, deep-link etc.)
+    args = parse_start_args(msg)
 
+    # 2) Cookies simulados (ou vindos dos args)
+    fbp = args.get("_fbp") or f"fbp-{user_id}-{int(time.time())}"
+    fbc = args.get("_fbc") or f"fbc-{user_id}-{int(time.time())}"
+    cookies = {"_fbp": encrypt_data(fbp), "_fbc": encrypt_data(fbc)}
+
+    # 3) Monta lead completo
     lead = {
         "telegram_id": user_id,
-        "username": msg.from_user.username or "",
-        "first_name": msg.from_user.first_name or "",
-        "last_name": msg.from_user.last_name or "",
-        "premium": getattr(msg.from_user, "is_premium", False),
-        "lang": msg.from_user.language_code or "",
+        "username": user.username or "",
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+        "premium": getattr(user, "is_premium", False),
+        "lang": user.language_code or "",
         "origin": "telegram",
         "user_agent": "TelegramBot/1.0",
-        "ip_address": f"192.168.{user_id % 256}.{(user_id // 256) % 256}",
+        "ip_address": args.get("ip") or f"192.168.{user_id % 256}.{(user_id // 256) % 256}",
         "event_key": f"tg-{user_id}-{int(time.time())}",
         "event_time": now_ts(),
 
         # cookies e metadados
         "cookies": cookies,
-        "device_info": {"platform": "telegram", "app": "aiogram"},
-        "session_metadata": {"msg_id": msg.message_id, "chat_id": msg.chat.id},
+        "device_info": {
+            "platform": "telegram",
+            "app": "aiogram",
+            "device": args.get("device"),
+            "os": args.get("os"),
+            "url": args.get("landing_url") or args.get("event_source_url"),
+        },
+        "session_metadata": {
+            "msg_id": msg.message_id,
+            "chat_id": msg.chat.id
+        },
 
-        # UTM placeholders
-        "utm_source": "telegram",
-        "utm_medium": "botb",
-        "utm_campaign": "vip_access",
+        # UTM (args tem prioridade)
+        "utm_source": args.get("utm_source") or "telegram",
+        "utm_medium": args.get("utm_medium") or "botb",
+        "utm_campaign": args.get("utm_campaign") or "vip_access",
+        "utm_term": args.get("utm_term"),
+        "utm_content": args.get("utm_content"),
+
+        # Fonte da página
+        "src_url": args.get("event_source_url") or args.get("landing_url"),
+        "value": args.get("value") or 0,
+        "currency": args.get("currency") or "BRL",
     }
 
-    # Salva lead no DB
+    # 4) Persistência rápida (idempotência pelo event_key único)
     await save_lead(lead)
 
-    # Gera link VIP
+    # 5) Gera link VIP (se o bot estiver com permissão no canal)
     vip_link = await generate_vip_link(lead["event_key"])
 
-    # Dispara eventos
-    asyncio.create_task(send_event_with_retry("Lead", lead))
-    asyncio.create_task(send_event_with_retry("Subscribe", lead))
+    # 6) Enfileira eventos (ao invés de disparar direto) → mais seguro em escala
+    await enqueue_event("Lead", lead)
+    await enqueue_event("Subscribe", lead)
+    LEADS_SENT.inc()
 
     return vip_link, lead
 
@@ -138,7 +186,31 @@ async def start_cmd(msg: types.Message):
     if vip_link:
         await msg.answer(f"✅ {lead['first_name']} seu acesso VIP:\n{vip_link}")
     else:
-        await msg.answer("⚠️ Seu acesso foi registrado, mas não foi possível gerar o link VIP.")
+        await msg.answer(
+            "⚠️ Seu acesso foi registrado, mas não foi possível gerar o link VIP.\n"
+            "Tente novamente em instantes."
+        )
+
+# =============================
+# Loops de background (alta escala)
+# =============================
+async def _sync_pending_loop():
+    """Retroalimenta pixels para leads com sent=False em intervalos fixos."""
+    while True:
+        try:
+            count = await sync_pending_leads()
+            if count:
+                logger.info(json.dumps({"event": "SYNC_PENDING", "processed": count}))
+        except Exception as e:
+            logger.error(json.dumps({"event": "SYNC_PENDING_ERROR", "error": str(e)}))
+        await asyncio.sleep(SYNC_INTERVAL_SEC)
+
+async def _event_queue_loop():
+    """Processa continuamente a fila de eventos (fb_google.process_event_queue)."""
+    try:
+        await process_event_queue()
+    except Exception as e:
+        logger.error(json.dumps({"event": "QUEUE_LOOP_ERROR", "error": str(e)}))
 
 # =============================
 # Runner
@@ -146,8 +218,12 @@ async def start_cmd(msg: types.Message):
 if __name__ == "__main__":
     async def main():
         logger.info(json.dumps({"event": "BOT_START"}))
-        asyncio.create_task(sync_pending_leads())
-        asyncio.create_task(process_event_queue())
+
+        # Loops de infraestrutura em background
+        asyncio.create_task(_sync_pending_loop())     # retrofeed periódico
+        asyncio.create_task(_event_queue_loop())      # fila de eventos
+
+        # Polling do Telegram
         await dp.start_polling()
 
     asyncio.run(main())
