@@ -1,3 +1,4 @@
+# db.py — versão 2.0 avançada e sincronizada
 import os, asyncio, json, time, hashlib, base64, logging
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
@@ -53,12 +54,13 @@ def _decrypt_value(s: Any) -> str:
 def _safe_dict(d: Any, decrypt: bool = False) -> Dict[str, Any]:
     if not isinstance(d, dict):
         return {}
-    if not decrypt:
-        return d
     out = {}
     for k, v in d.items():
         try:
-            out[k] = _decrypt_value(v) if isinstance(v, str) else v
+            if decrypt and isinstance(v, str):
+                out[k] = _decrypt_value(v)
+            else:
+                out[k] = v
         except Exception:
             out[k] = v
     return out
@@ -99,6 +101,7 @@ class Lead(Base):
 
     src_url = Column(Text, nullable=True)
     value = Column(Float, nullable=True)
+    currency = Column(String(10), nullable=True)
 
     user_data = Column(JSONB, nullable=False, default=dict)
     custom_data = Column(JSONB, nullable=True, default=dict)
@@ -128,13 +131,15 @@ def init_db():
         logger.error(f"Erro init DB: {e}")
 
 # ==============================
-# Priority Score
+# Priority Score (inteligente)
 # ==============================
 def compute_priority_score(user_data: Dict[str, Any], custom_data: Dict[str, Any]) -> float:
     score = 0.0
     if user_data.get("username"): score += 2
     if user_data.get("first_name"): score += 1
-    if user_data.get("premium"): score += 2
+    if user_data.get("premium"): score += 3
+    if user_data.get("country"): score += 1
+    if user_data.get("external_id"): score += 2
     try:
         score += float(custom_data.get("subscribe_count") or 0) * 3
     except Exception:
@@ -142,7 +147,7 @@ def compute_priority_score(user_data: Dict[str, Any], custom_data: Dict[str, Any
     return score
 
 # ==============================
-# Save Lead
+# Save Lead (insert/update idempotente)
 # ==============================
 async def save_lead(data: dict, event_record: Optional[dict] = None, retries: int = 3) -> bool:
     if not SessionLocal:
@@ -176,6 +181,7 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
                     lead.user_data = {**(lead.user_data or {}), **normalized_ud}
                     lead.custom_data = {**(lead.custom_data or {}), **custom}
                     lead.src_url = data.get("src_url") or lead.src_url
+                    lead.currency = data.get("currency") or lead.currency
                     if enc_cookies:
                         ec = lead.cookies or {}
                         ec.update(enc_cookies)
@@ -184,7 +190,7 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
                     lead.session_metadata = {**(lead.session_metadata or {}), **(data.get("session_metadata") or {})}
                     if event_record:
                         eh = lead.event_history or []
-                        eh.append(event_record)
+                        eh.append({**event_record, "ts": datetime.now(timezone.utc).isoformat()})
                         lead.event_history = eh
                 else:
                     # insert
@@ -195,12 +201,13 @@ async def save_lead(data: dict, event_record: Optional[dict] = None, retries: in
                         route_key=data.get("route_key"),
                         src_url=data.get("src_url"),
                         value=data.get("value"),
+                        currency=data.get("currency"),
                         user_data=normalized_ud,
                         custom_data=custom,
                         cookies=enc_cookies,
                         device_info=data.get("device_info"),
                         session_metadata=data.get("session_metadata"),
-                        event_history=[event_record] if event_record else []
+                        event_history=[{**event_record, "ts": datetime.now(timezone.utc).isoformat()}] if event_record else []
                     )
                     session.add(lead)
 
@@ -286,6 +293,7 @@ async def get_historical_leads(limit: int = 50) -> List[Dict[str, Any]]:
                     "route_key": r.route_key,
                     "src_url": r.src_url,
                     "value": r.value,
+                    "currency": r.currency,
                     "user_data": ud,
                     "custom_data": cd,
                     "cookies": dec_cookies,
@@ -337,24 +345,25 @@ async def sync_pending_leads(batch_size: int = 20) -> int:
     processed = 0
     for l in leads:
         try:
-            ud = l.user_data or {}
-            event_type = l.event_type or "Lead"
-
             lead_data = {
                 "telegram_id": l.telegram_id,
-                "user_data": ud,
                 "event_key": l.event_key,
-                "event_type": event_type,
+                "event_type": l.event_type or "Lead",
+                "user_data": l.user_data or {},
+                "custom_data": l.custom_data or {},
                 "cookies": _safe_dict(l.cookies or {}, decrypt=True),
                 "src_url": l.src_url,
                 "value": l.value,
+                "currency": l.currency
             }
 
-            results = await send_event_to_all(lead_data, et=event_type)
+            results = await send_event_to_all(lead_data, et=lead_data["event_type"])
 
             if any((isinstance(v, dict) and v.get("ok")) for v in (results or {}).values()):
                 l.sent = True
                 l.last_sent_at = datetime.now(timezone.utc)
+            else:
+                l.last_attempt_at = datetime.now(timezone.utc)
 
             session = SessionLocal()
             session.merge(l)
