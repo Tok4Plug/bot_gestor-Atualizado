@@ -1,4 +1,4 @@
-# bot.py — versão 2.4 com Invite Link em mensagem separada (Preview otimizado)
+# bot.py — versão 2.5 com Invite Link corrigido (Preview garantido)
 import os, logging, json, asyncio, time
 from datetime import datetime
 from typing import Dict, Any, Optional
@@ -45,10 +45,6 @@ BRIDGE_NS = os.getenv("BRIDGE_NS", "typebot")
 
 SECRET_KEY = os.getenv("SECRET_KEY", Fernet.generate_key().decode())
 fernet = Fernet(SECRET_KEY.encode() if isinstance(SECRET_KEY, str) else SECRET_KEY)
-
-# Preview vars
-VIP_PUBLIC_USERNAME = (os.getenv("VIP_PUBLIC_USERNAME") or "").strip().lstrip("@")
-VIP_PREVIEW_IMAGE_URL = (os.getenv("VIP_PREVIEW_IMAGE_URL") or "").strip()
 
 if not BOT_TOKEN or not VIP_CHANNEL:
     raise RuntimeError("BOT_TOKEN e VIP_CHANNEL são obrigatórios")
@@ -216,21 +212,13 @@ async def send_event_with_retry(event_type: str, lead: Dict[str, Any], retries: 
     return False
 
 # =============================
-# Preview helper (invite sozinho)
+# Preview helper (link como primeira URL)
 # =============================
 async def send_vip_message_with_preview(msg: types.Message, first_name: str, vip_link: str):
     try:
-        # Mensagem 1: header sem links
-        await msg.answer(f"✅ <b>{first_name}</b>, seu acesso VIP foi liberado!\nLink exclusivo expira em 24h.")
-
-        await asyncio.sleep(0.3)
-
-        # Mensagem 2: apenas a URL do invite, sozinha (força preview)
-        await bot.send_message(
-            msg.chat.id,
-            vip_link,
-            disable_web_page_preview=False
-        )
+        # Invite link como primeira URL (preview garantido)
+        text = f"✅ <b>SUPORTE</b> seu acesso VIP:\n{vip_link}\n\n🔑 Link exclusivo expira em 24h."
+        await msg.answer(text, disable_web_page_preview=False)
     except Exception as e:
         logger.error(json.dumps({"event": "PREVIEW_SEND_ERROR", "error": str(e)}))
         await msg.answer(f"🔑 Acesse aqui: {vip_link}", disable_web_page_preview=False)
