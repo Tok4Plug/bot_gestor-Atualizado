@@ -1,4 +1,4 @@
-# bot.py — versão 2.2 com preview de link VIP (card automático restaurado)
+# bot.py — versão 2.3 com Preview avançado do link VIP (card automático otimizado)
 import os, logging, json, asyncio, time
 from datetime import datetime
 from typing import Dict, Any, Optional
@@ -38,13 +38,17 @@ logger.addHandler(ch)
 # ENV
 # =============================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-VIP_CHANNEL = os.getenv("VIP_CHANNEL")
+VIP_CHANNEL = os.getenv("VIP_CHANNEL")  # chat_id do canal VIP
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 SYNC_INTERVAL_SEC = int(os.getenv("SYNC_INTERVAL_SEC", "60"))
 BRIDGE_NS = os.getenv("BRIDGE_NS", "typebot")
 
 SECRET_KEY = os.getenv("SECRET_KEY", Fernet.generate_key().decode())
 fernet = Fernet(SECRET_KEY.encode() if isinstance(SECRET_KEY, str) else SECRET_KEY)
+
+# Novo: opções para preview
+VIP_PUBLIC_USERNAME = (os.getenv("VIP_PUBLIC_USERNAME") or "").strip().lstrip("@")
+VIP_PREVIEW_IMAGE_URL = (os.getenv("VIP_PREVIEW_IMAGE_URL") or "").strip()
 
 if not BOT_TOKEN or not VIP_CHANNEL:
     raise RuntimeError("BOT_TOKEN e VIP_CHANNEL são obrigatórios")
@@ -212,6 +216,36 @@ async def send_event_with_retry(event_type: str, lead: Dict[str, Any], retries: 
     return False
 
 # =============================
+# Preview helper
+# =============================
+async def send_vip_message_with_preview(msg: types.Message, first_name: str, vip_link: str):
+    header = f"✅ <b>{first_name}</b> seu acesso VIP:"
+
+    if VIP_PUBLIC_USERNAME:
+        public_url = f"https://t.me/{VIP_PUBLIC_USERNAME}"
+        text = (
+            f"{header}\n\n"
+            f"{public_url}\n"  # PRIMEIRA URL → gera o card
+            f"🔑 Link exclusivo (1 uso • 24h):\n{vip_link}"
+        )
+        await msg.answer(text, disable_web_page_preview=False)
+        return
+
+    if VIP_PREVIEW_IMAGE_URL:
+        caption = (
+            f"{header}\n\n"
+            f"🔑 Link exclusivo (1 uso • 24h):\n{vip_link}"
+        )
+        try:
+            await msg.answer_photo(VIP_PREVIEW_IMAGE_URL, caption=caption, parse_mode="HTML")
+        except Exception:
+            await msg.answer(caption, disable_web_page_preview=False)
+        return
+
+    text = f"{header}\n\n{vip_link}"
+    await msg.answer(text, disable_web_page_preview=False)
+
+# =============================
 # Processamento de novo lead
 # =============================
 async def process_new_lead(msg: types.Message):
@@ -241,11 +275,7 @@ async def start_cmd(msg: types.Message):
     try:
         vip_link, lead = await process_new_lead(msg)
         if vip_link:
-            # Agora o preview (card) do link aparece porque disable_web_page_preview=False
-            await msg.answer(
-                f"✅ <b>{lead['first_name']}</b> seu acesso VIP:\n{vip_link}",
-                disable_web_page_preview=False
-            )
+            await send_vip_message_with_preview(msg, lead['first_name'], vip_link)
         else:
             await msg.answer("⚠️ Seu acesso foi registrado, mas não foi possível gerar o link VIP agora.")
     except Exception as e:
