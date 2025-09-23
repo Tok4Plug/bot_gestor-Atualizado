@@ -1,4 +1,4 @@
-# bot.py — versão 2.3 com Preview avançado do link VIP (card automático otimizado)
+# bot.py — versão 2.4 com Invite Link em mensagem separada (Preview otimizado)
 import os, logging, json, asyncio, time
 from datetime import datetime
 from typing import Dict, Any, Optional
@@ -46,7 +46,7 @@ BRIDGE_NS = os.getenv("BRIDGE_NS", "typebot")
 SECRET_KEY = os.getenv("SECRET_KEY", Fernet.generate_key().decode())
 fernet = Fernet(SECRET_KEY.encode() if isinstance(SECRET_KEY, str) else SECRET_KEY)
 
-# Novo: opções para preview
+# Preview vars
 VIP_PUBLIC_USERNAME = (os.getenv("VIP_PUBLIC_USERNAME") or "").strip().lstrip("@")
 VIP_PREVIEW_IMAGE_URL = (os.getenv("VIP_PREVIEW_IMAGE_URL") or "").strip()
 
@@ -216,34 +216,24 @@ async def send_event_with_retry(event_type: str, lead: Dict[str, Any], retries: 
     return False
 
 # =============================
-# Preview helper
+# Preview helper (invite sozinho)
 # =============================
 async def send_vip_message_with_preview(msg: types.Message, first_name: str, vip_link: str):
-    header = f"✅ <b>{first_name}</b> seu acesso VIP:"
+    try:
+        # Mensagem 1: header sem links
+        await msg.answer(f"✅ <b>{first_name}</b>, seu acesso VIP foi liberado!\nLink exclusivo expira em 24h.")
 
-    if VIP_PUBLIC_USERNAME:
-        public_url = f"https://t.me/{VIP_PUBLIC_USERNAME}"
-        text = (
-            f"{header}\n\n"
-            f"{public_url}\n"  # PRIMEIRA URL → gera o card
-            f"🔑 Link exclusivo (1 uso • 24h):\n{vip_link}"
+        await asyncio.sleep(0.3)
+
+        # Mensagem 2: apenas a URL do invite, sozinha (força preview)
+        await bot.send_message(
+            msg.chat.id,
+            vip_link,
+            disable_web_page_preview=False
         )
-        await msg.answer(text, disable_web_page_preview=False)
-        return
-
-    if VIP_PREVIEW_IMAGE_URL:
-        caption = (
-            f"{header}\n\n"
-            f"🔑 Link exclusivo (1 uso • 24h):\n{vip_link}"
-        )
-        try:
-            await msg.answer_photo(VIP_PREVIEW_IMAGE_URL, caption=caption, parse_mode="HTML")
-        except Exception:
-            await msg.answer(caption, disable_web_page_preview=False)
-        return
-
-    text = f"{header}\n\n{vip_link}"
-    await msg.answer(text, disable_web_page_preview=False)
+    except Exception as e:
+        logger.error(json.dumps({"event": "PREVIEW_SEND_ERROR", "error": str(e)}))
+        await msg.answer(f"🔑 Acesse aqui: {vip_link}", disable_web_page_preview=False)
 
 # =============================
 # Processamento de novo lead
@@ -271,7 +261,7 @@ async def process_new_lead(msg: types.Message):
 # =============================
 @dp.message_handler(commands=["start"])
 async def start_cmd(msg: types.Message):
-    await msg.answer("👋 Validando seu acesso VIP.…\nVocê está prestes a liberar seu acesso 𝗥𝗘𝗗 𝗦𝗘𝗖𝗥𝗘𝗧 ❤️‍🔥.")
+    await msg.answer("👋 Validando seu acesso VIP…")
     try:
         vip_link, lead = await process_new_lead(msg)
         if vip_link:
