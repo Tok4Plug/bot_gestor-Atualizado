@@ -1,4 +1,4 @@
-# bot.py — versão 2.1 com preview de link VIP (cartão automático)
+# bot.py — versão 2.2 com envio do link VIP em mensagem separada (força card preview)
 import os, logging, json, asyncio, time
 from datetime import datetime
 from typing import Dict, Any, Optional
@@ -98,6 +98,7 @@ def parse_start_args(msg: types.Message) -> Dict[str, Any]:
             return {}
         raw = raw.strip()
 
+        # Caso 1: token vindo do Bridge
         if raw.startswith("t_"):
             token = raw[2:]
             blob = redis_client.get(f"{BRIDGE_NS}:{token}")
@@ -110,6 +111,7 @@ def parse_start_args(msg: types.Message) -> Dict[str, Any]:
                     return {}
             return {}
 
+        # Caso 2: JSON direto
         if raw.startswith("{") and raw.endswith("}"):
             return json.loads(raw)
 
@@ -124,10 +126,12 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
     user_id = user.id
     now = int(time.time())
 
+    # Cookies (_fbp/_fbc)
     fbp = args.get("_fbp") or f"fb.1.{now}.{user_id}"
     fbc = args.get("_fbc") or (f"fb.1.{now}.fbclid.{user_id}" if args.get("fbclid") else f"fbc-{user_id}-{now}")
     cookies = {"_fbp": encrypt_data(fbp), "_fbc": encrypt_data(fbc)}
 
+    # Device info
     device_info = {
         "platform": "telegram",
         "app": "aiogram",
@@ -136,6 +140,7 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         "url": args.get("landing_url") or args.get("event_source_url"),
     }
 
+    # Lead completo
     lead: Dict[str, Any] = {
         "telegram_id": user_id,
         "username": user.username or "",
@@ -154,21 +159,25 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         "device_info": device_info,
         "session_metadata": {"msg_id": msg.message_id, "chat_id": msg.chat.id},
 
+        # UTM
         "utm_source": args.get("utm_source") or "telegram",
         "utm_medium": args.get("utm_medium") or "botb",
         "utm_campaign": args.get("utm_campaign") or "vip_access",
         "utm_term": args.get("utm_term"),
         "utm_content": args.get("utm_content"),
 
+        # IDs Ads
         "gclid": args.get("gclid"),
         "gbraid": args.get("gbraid"),
         "wbraid": args.get("wbraid"),
         "cid": args.get("cid"),
         "fbclid": args.get("fbclid"),
 
+        # Valor/Currency
         "value": args.get("value") or 0,
         "currency": args.get("currency") or "BRL",
 
+        # user_data
         "user_data": {
             "email": args.get("email"),
             "phone": args.get("phone"),
@@ -219,15 +228,20 @@ async def process_new_lead(msg: types.Message):
     args = parse_start_args(msg)
     lead = build_lead(msg.from_user, msg, args)
 
+    # Salva no DB
     await save_lead(lead)
+
+    # Cria link VIP
     vip_link = await generate_vip_link(lead["event_key"])
 
+    # Enfileira eventos
     try:
         await enqueue_event("Lead", {"event_key": lead["event_key"], "telegram_id": lead["telegram_id"]})
         await enqueue_event("Subscribe", {"event_key": lead["event_key"], "telegram_id": lead["telegram_id"]})
     except Exception as e:
         logger.warning(json.dumps({"event": "QUEUE_ENQ_FAIL", "error": str(e)}))
 
+    # Dispara eventos
     asyncio.create_task(send_event_with_retry("Lead", lead))
     asyncio.create_task(send_event_with_retry("Subscribe", lead))
 
@@ -242,11 +256,9 @@ async def start_cmd(msg: types.Message):
     try:
         vip_link, lead = await process_new_lead(msg)
         if vip_link:
-            # Aqui garantimos que o preview (card) será exibido
-            await msg.answer(
-                f"✅ <b>{lead['first_name']}</b> seu acesso VIP:\n{vip_link}",
-                disable_web_page_preview=False
-            )
+            # Mensagem separada para forçar preview
+            await msg.answer(f"✅ <b>{lead['first_name']}</b> seu acesso VIP:")
+            await msg.answer(vip_link, disable_web_page_preview=False)
         else:
             await msg.answer("⚠️ Seu acesso foi registrado, mas não foi possível gerar o link VIP agora.")
     except Exception as e:
