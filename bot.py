@@ -1,4 +1,4 @@
-# bot.py — versão 2.0 avançada, robusta e integrada ao Bridge
+# bot.py — versão 2.1 com preview de link VIP (cartão automático)
 import os, logging, json, asyncio, time
 from datetime import datetime
 from typing import Dict, Any, Optional
@@ -75,10 +75,6 @@ def encrypt_data(data: Optional[str]) -> str:
 # VIP Link
 # =============================
 async def generate_vip_link(event_key: str, member_limit=1, expire_hours=24) -> Optional[str]:
-    """
-    Gera link de convite temporário para o canal VIP.
-    Caso falhe (sem permissões, etc.), retorna None.
-    """
     try:
         invite = await bot.create_chat_invite_link(
             chat_id=int(VIP_CHANNEL),
@@ -96,33 +92,24 @@ async def generate_vip_link(event_key: str, member_limit=1, expire_hours=24) -> 
 # Parser de argumentos do /start
 # =============================
 def parse_start_args(msg: types.Message) -> Dict[str, Any]:
-    """
-    Tenta extrair dados complementares do /start em duas formas:
-    1) Token do Bridge: /start t_<token> → busca no Redis (chave f"{BRIDGE_NS}:{token}")
-    2) JSON curto inline: /start {"utm_source":"..."} → parse direto
-    Se não houver, retorna {}.
-    """
     try:
         raw = msg.get_args() if hasattr(msg, "get_args") else None
         if not raw:
             return {}
         raw = raw.strip()
 
-        # Caso 1: token vindo do Bridge
         if raw.startswith("t_"):
             token = raw[2:]
             blob = redis_client.get(f"{BRIDGE_NS}:{token}")
             if blob:
                 try:
                     data = json.loads(blob)
-                    # idempotência simples: descarta token após consumo
                     redis_client.delete(f"{BRIDGE_NS}:{token}")
                     return data
                 except Exception:
                     return {}
             return {}
 
-        # Caso 2: JSON direto
         if raw.startswith("{") and raw.endswith("}"):
             return json.loads(raw)
 
@@ -137,13 +124,10 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
     user_id = user.id
     now = int(time.time())
 
-    # Cookies (_fbp/_fbc): prioriza Bridge → gera fallback local
     fbp = args.get("_fbp") or f"fb.1.{now}.{user_id}"
     fbc = args.get("_fbc") or (f"fb.1.{now}.fbclid.{user_id}" if args.get("fbclid") else f"fbc-{user_id}-{now}")
-
     cookies = {"_fbp": encrypt_data(fbp), "_fbc": encrypt_data(fbc)}
 
-    # Device info
     device_info = {
         "platform": "telegram",
         "app": "aiogram",
@@ -152,7 +136,6 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         "url": args.get("landing_url") or args.get("event_source_url"),
     }
 
-    # Lead completo
     lead: Dict[str, Any] = {
         "telegram_id": user_id,
         "username": user.username or "",
@@ -171,25 +154,21 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
         "device_info": device_info,
         "session_metadata": {"msg_id": msg.message_id, "chat_id": msg.chat.id},
 
-        # UTM
         "utm_source": args.get("utm_source") or "telegram",
         "utm_medium": args.get("utm_medium") or "botb",
         "utm_campaign": args.get("utm_campaign") or "vip_access",
         "utm_term": args.get("utm_term"),
         "utm_content": args.get("utm_content"),
 
-        # IDs Ads
         "gclid": args.get("gclid"),
         "gbraid": args.get("gbraid"),
         "wbraid": args.get("wbraid"),
         "cid": args.get("cid"),
         "fbclid": args.get("fbclid"),
 
-        # Valor/Currency
         "value": args.get("value") or 0,
         "currency": args.get("currency") or "BRL",
 
-        # user_data para o CAPI (utils normaliza e hasheia quando necessário)
         "user_data": {
             "email": args.get("email"),
             "phone": args.get("phone"),
@@ -210,13 +189,9 @@ def build_lead(user: types.User, msg: types.Message, args: Dict[str, Any]) -> Di
     return lead
 
 # =============================
-# Envio de eventos com retry (direto)
+# Envio de eventos com retry
 # =============================
 async def send_event_with_retry(event_type: str, lead: Dict[str, Any], retries: int = 5, base_delay: float = 1.5) -> bool:
-    """
-    Dispara o evento para todas as integrações (FB/GA4) com retry exponencial.
-    Usa fb_google.send_event_to_all(lead, et=event_type).
-    """
     attempt = 0
     while attempt < retries:
         try:
@@ -241,30 +216,18 @@ async def send_event_with_retry(event_type: str, lead: Dict[str, Any], retries: 
 # Processamento de novo lead
 # =============================
 async def process_new_lead(msg: types.Message):
-    """
-    1) Recupera payload do Bridge (/start t_<token>) ou JSON inline
-    2) Constrói lead enriquecido
-    3) Salva no DB
-    4) Gera link VIP
-    5) Enfileira e dispara eventos Lead/Subscribe
-    """
     args = parse_start_args(msg)
     lead = build_lead(msg.from_user, msg, args)
 
-    # Persistência rápida (idempotente pelo event_key)
     await save_lead(lead)
-
-    # Link VIP
     vip_link = await generate_vip_link(lead["event_key"])
 
-    # Enfileira: assinatura correta (event_type, lead_minimal)
     try:
         await enqueue_event("Lead", {"event_key": lead["event_key"], "telegram_id": lead["telegram_id"]})
         await enqueue_event("Subscribe", {"event_key": lead["event_key"], "telegram_id": lead["telegram_id"]})
     except Exception as e:
         logger.warning(json.dumps({"event": "QUEUE_ENQ_FAIL", "error": str(e)}))
 
-    # Disparo imediato com retry (assíncrono)
     asyncio.create_task(send_event_with_retry("Lead", lead))
     asyncio.create_task(send_event_with_retry("Subscribe", lead))
 
@@ -275,11 +238,15 @@ async def process_new_lead(msg: types.Message):
 # =============================
 @dp.message_handler(commands=["start"])
 async def start_cmd(msg: types.Message):
-    await msg.answer("👋 Validando seu acesso VIP...")
+    await msg.answer("👋 Validando seu acesso VIP..."\nVocê está prestes a liberar seu acesso 𝗥𝗘𝗗 𝗦𝗘𝗖𝗥𝗘𝗧 ❤️‍🔥. )
     try:
         vip_link, lead = await process_new_lead(msg)
         if vip_link:
-            await msg.answer(f"✅ {lead['first_name']} seu acesso VIP:\n {vip_link}")
+            # Aqui garantimos que o preview (card) será exibido
+            await msg.answer(
+                f"✅ <b>{lead['first_name']}</b> seu acesso VIP:\n{vip_link}",
+                disable_web_page_preview=False
+            )
         else:
             await msg.answer("⚠️ Seu acesso foi registrado, mas não foi possível gerar o link VIP agora.")
     except Exception as e:
@@ -294,9 +261,6 @@ async def fallback(msg: types.Message):
 # Loops de background
 # =============================
 async def _sync_pending_loop():
-    """
-    Retrofeed periódico de leads com sent=False (seu db.sync_pending_leads).
-    """
     while True:
         try:
             count = await sync_pending_leads()
@@ -307,9 +271,6 @@ async def _sync_pending_loop():
         await asyncio.sleep(SYNC_INTERVAL_SEC)
 
 async def _event_queue_loop():
-    """
-    Loop de processamento da fila (fb_google.process_event_queue).
-    """
     while True:
         try:
             await process_event_queue()
