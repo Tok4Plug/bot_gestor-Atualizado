@@ -238,7 +238,7 @@ async def process_new_lead(msg: types.Message):
 # =============================
 @dp.message_handler(commands=["start"])
 async def start_cmd(msg: types.Message):
-    await msg.answer("👋 Validando seu acesso VIP..."\nVocê está prestes a liberar seu acesso 𝗥𝗘𝗗 𝗦𝗘𝗖𝗥𝗘𝗧 ❤️‍🔥. )
+    await msg.answer("👋 Validando seu acesso VIP..."\n Você está prestes a liberar seu acesso 𝗥𝗘𝗗 𝗦𝗘𝗖𝗥𝗘𝗧 ❤️‍🔥. )
     try:
         vip_link, lead = await process_new_lead(msg)
         if vip_link:
