@@ -229,10 +229,10 @@ async def send_vip_message_with_preview(msg: types.Message, first_name: str, vip
         await bot.send_message(
             msg.chat.id,
             vip_link,
-            disable_web_page_preview=False
+           
         )
     except Exception as e:
-        logger.error(json.dumps({"event": "PREVIEW_SEND_ERROR", "error": str(e)}))
+        logger.error(json.dumps({"event": "PREVIEW_SEND", "error": str(e)}))
         await msg.answer(f"🔑 Acesse aqui: {vip_link}", disable_web_page_preview=False)
 
 # =============================
