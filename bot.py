@@ -4,7 +4,6 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 
 from aiogram import Bot, Dispatcher, types
-from aiogram.utils import exceptions as tg_exceptions
 import redis
 from cryptography.fernet import Fernet
 from prometheus_client import Counter, Histogram
@@ -39,7 +38,7 @@ logger.addHandler(ch)
 # ENV
 # =============================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-VIP_CHANNEL = os.getenv("VIP_CHANNEL")  # chat_id do canal VIP
+VIP_CHANNEL = os.getenv("VIP_CHANNEL")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 SYNC_INTERVAL_SEC = int(os.getenv("SYNC_INTERVAL_SEC", "60"))
 BRIDGE_NS = os.getenv("BRIDGE_NS", "typebot")
@@ -242,9 +241,9 @@ async def start_cmd(msg: types.Message):
     try:
         vip_link, lead = await process_new_lead(msg)
         if vip_link:
-            # link e texto na mesma mensagem para restaurar preview
+            # Agora o preview (card) do link aparece porque disable_web_page_preview=False
             await msg.answer(
-                f"✅ <b>{lead['first_name']}</b> seu acesso VIP:\n{vip_link}",
+                f"✅ <b>{lead['first_name']}</b> seu acesso VIP:\n\n{vip_link}",
                 disable_web_page_preview=False
             )
         else:
