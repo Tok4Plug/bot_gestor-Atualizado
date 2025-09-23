@@ -279,7 +279,7 @@ async def start_cmd(msg: types.Message):
     try:
         vip_link, lead = await process_new_lead(msg)
         if vip_link:
-            await msg.answer(f"✅ {lead['first_name']} seu acesso VIP:\n{vip_link}")
+            await msg.answer(f"✅ {lead['first_name']} seu acesso VIP:\n {vip_link}")
         else:
             await msg.answer("⚠️ Seu acesso foi registrado, mas não foi possível gerar o link VIP agora.")
     except Exception as e:
