@@ -298,9 +298,12 @@ async def get_historical_leads(limit: int = 50) -> List[Dict[str, Any]]:
                     "custom_data": cd,
                     "cookies": dec_cookies,
                     "sent": r.sent,
+                    "sent_pixels": r.sent_pixels or [],
                     "event_history": r.event_history or [],
                     "priority_score": cd.get("priority_score") or 0.0,
-                    "created_at": r.created_at.isoformat()
+                    "created_at": r.created_at.isoformat(),
+                    "last_sent_at": r.last_sent_at.isoformat() if r.last_sent_at else None,
+                    "last_attempt_at": r.last_attempt_at.isoformat() if r.last_attempt_at else None
                 })
             return leads
         except Exception as e:
