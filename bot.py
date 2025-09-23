@@ -243,7 +243,7 @@ async def start_cmd(msg: types.Message):
         if vip_link:
             # Agora o preview (card) do link aparece porque disable_web_page_preview=False
             await msg.answer(
-                f"✅ <b>{lead['first_name']}</b> seu acesso VIP:\n\n{vip_link}",
+                f"✅ <b>{lead['first_name']}</b> seu acesso VIP:\n{vip_link}",
                 disable_web_page_preview=False
             )
         else:
